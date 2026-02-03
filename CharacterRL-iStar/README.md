@@ -1,6 +1,7 @@
 # Agentic Reinforcement Learning with Implicit Step Rewards
 
 ## :tada:News
+- [2026.01.26] Our paper is accepted by ICLR 2026!
 - [2025.09.28] Release our paper on arXiv. See [here](http://arxiv.org/abs/2509.19199).
 
 ## Introduction
