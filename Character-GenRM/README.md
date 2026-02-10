@@ -2,8 +2,9 @@
 
 The official repository for "P-GenRM: Personalized Generative Reward Model with Test-time User-based Scaling".
 
-More details about code, weights will be released, stay tuned!
-
+## :tada:News
+- [2026.01.26] Our paper is accepted by ICLR 2026!
+- [2026.02.06] Our paper is selected for an oral presentation at ICLR 2026!
 
 ## Introduction
 Consider an AI assistant interacting with two users: one who appreciates witty humor and another who prefers concise professionalism. How can the model adapt its responses to such diverse preferences? Traditional RLHF relies on a single reward model, resulting in uniform behavior. Existing approaches to personalized alignment often reduce diverse individual preferences to fixed rules, failing to capture contextual variations (e.g., preferring brevity while driving but richness in casual conversations). They also show limited generalization to new users lacking historical data.
