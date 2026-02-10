@@ -5,9 +5,149 @@ from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 import torch
-
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.environments.prompts import *
+from agent_system.memory import SearchMemory, SimpleMemory
+
+def parse_gamefile(infos):
+    gamefile = []
+    for info in infos:
+        if 'extra.gamefile' in info:
+            gamefile.append(info['extra.gamefile'])
+        else:
+            gamefile.append(None)
+    return gamefile
+
+def set_gamefile(infos, gamefile):
+    for i in range(len(infos)):
+        if 'extra.gamefile' in infos[i]:
+            infos[i]['extra.gamefile'] = gamefile[i]
+        else:
+            infos[i]['extra.gamefile'] = None
+    return infos
+
+
+class AlfWorldEnvironmentManager(EnvironmentManagerBase):
+    def __init__(self, envs, projection_f, env_name):
+        self.buffers = None
+        super().__init__(envs, projection_f, env_name)
+    
+    def reset(self):
+        text_obs, image_obs, infos = self.envs.reset()
+        self.gamefile = parse_gamefile(infos)
+        # initialize the history buffer
+        if self.buffers is not None:
+            self.buffers.clear()
+        self.buffers = [[] for _ in range(len(text_obs))]
+        self.tasks = []
+        self.pre_text_obs = text_obs
+        self.extract_task(text_obs)
+
+        full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
+        return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
+    
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
+        text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
+        self.save_to_history_buffer(self.pre_text_obs, actions)
+        self.pre_text_obs = text_obs
+
+        full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
+        if infos[0].get("extra.gamefile") is None:
+            infos = set_gamefile(infos, self.gamefile)
+
+        # add action_valid to infos
+        for i, info in enumerate(infos):
+            info['is_action_valid'] = to_numpy(valids[i])
+
+        next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}
+        rewards = to_numpy(rewards)
+        dones = to_numpy(dones)
+
+        return next_observations, rewards, dones, infos
+    
+    def extract_task(self, text_obs: List[str]):
+        for obs in text_obs:
+            task_start = obs.find('Your task is to: ')
+            
+            if task_start != -1:
+                self.tasks.append(obs[task_start + len('Your task is to: '):].strip())
+            else:
+                raise ValueError("Task description not found in text observation.")
+        
+
+    def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False, history_length: int = 2) -> List[str]:
+        """
+        This function builds the text observation for the agent.
+        """
+        postprocess_text_obs = []
+        for i in range(len(text_obs)):
+            # exclude 'help' in admissible_actions[i]
+            reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
+
+            if init or history_length <= 0:
+                obs = ALFWORLD_TEMPLATE_NO_HIS.format(
+                    current_observation=text_obs[i],
+                    admissible_actions=reformatted_admissible_actions
+                )
+            else:
+                # Get last `history_length` steps
+                recent_history = self.buffers[i][-history_length:]
+                valid_history_length = len(recent_history)
+                start_index = len(self.buffers[i]) - valid_history_length
+                action_history = ""
+                for j, record in enumerate(recent_history):
+                    step_number = start_index + j + 1
+                    action = record["action"]
+                    env_obs = record["text_obs"]
+                    action_history += f"\n[Observation {step_number}: '{env_obs}', Action {step_number}: '{action}']"
+                obs = ALFWORLD_TEMPLATE.format(
+                    task_description=self.tasks[i],
+                    step_count=len(self.buffers[i]),
+                    history_length=valid_history_length,
+                    action_history=action_history.strip(),
+                    current_step=len(self.buffers[i]) + 1,
+                    current_observation=text_obs[i],
+                    admissible_actions=reformatted_admissible_actions
+                )
+
+            postprocess_text_obs.append(obs)
+
+        return postprocess_text_obs
+
+    def save_to_history_buffer(self, text_obs, actions):
+        for i in range(len(actions)):
+            self.buffers[i].append({'text_obs': text_obs[i], 'action': actions[i]})
+
+    def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
+        # Find the last entry with active masks
+        for i in reversed(range(len(total_batch_list[batch_idx]))):
+            batch_item = total_batch_list[batch_idx][i]
+            if batch_item['active_masks']:
+                info = total_infos[batch_idx][i]
+                won_value = float(info['won'])
+                success['success_rate'].append(won_value)
+                
+                # Process game file if it exists
+                gamefile = info.get("extra.gamefile")
+                if gamefile:
+                    self._process_gamefile(gamefile, won_value, success)
+                return  # Exit after finding the first active mask
+
+    def _process_gamefile(self, gamefile, won_value, success):
+        tasks = [
+            "pick_and_place",
+            "pick_two_obj_and_place",
+            "look_at_obj_in_light",
+            "pick_heat_then_place_in_recep",
+            "pick_cool_then_place_in_recep",
+            "pick_clean_then_place_in_recep",
+        ]
+        
+        for task in tasks:
+            if task in gamefile:
+                success[f"{task}_success_rate"].append(won_value)
+                break
 
 
 class SokobanEnvironmentManager(EnvironmentManagerBase):
@@ -118,6 +258,49 @@ class SokobanEnvironmentManager(EnvironmentManagerBase):
     def save_to_history_buffer(self, text_obs, actions):
         for i in range(len(actions)):
             self.buffers[i].append({'text_obs': text_obs[i], 'action': self.ACTION_LOOKUP[actions[i]]})
+
+
+class GymCardEnvironmentManager(EnvironmentManagerBase):
+    def __init__(self, envs, projection_f, env_name):
+        super().__init__(envs, projection_f, env_name)
+    
+    def reset(self) -> Dict[str, Any]:
+        obs, infos = self.envs.reset()
+        # infos = [None] * self.envs.num_envs
+        observations = {'text': self.build_text_obs(infos), 'image': obs, 'anchor': obs.copy()}
+        
+        return observations, infos
+
+    def step(self, text_actions: List[str]):
+        next_observations, rewards, dones, infos = super().step(text_actions)
+        
+        # add text observation to next_observations
+        next_observations['text'] = self.build_text_obs(infos)
+        next_observations['anchor'] = next_observations['image'].copy()
+
+        return next_observations, rewards, dones, infos
+
+
+    def build_text_obs(self, infos: Tuple[Dict]=None) -> List[str]:
+        """
+        This function builds the text observation for the agent.
+        """
+        postprocess_text_obs = []
+        for i in range(len(infos)):
+            if 'ezpoints' in self.env_name.lower():
+                text_formula = ''.join(str(element) for element in infos[i]['Formula']) if infos[i] is not None else ''
+                obs = GYM_CARDS_EZPOINTS_TEMPLATE.format(text_formula=text_formula)
+            elif 'points24' in self.env_name.lower():
+                text_formula = ''.join(str(element) for element in infos[i]['Formula']) if infos[i] is not None else ''
+                obs = GYM_CARDS_POINTS24_TEMPLATE.format(text_formula=text_formula)
+            elif 'numberline' in self.env_name.lower():
+                obs = GYM_CARDS_NUMBERLINE_TEMPLATE
+            elif "blackjack" in self.env_name.lower():
+                obs = GYM_CARDS_BLACKJACK_TEMPLATE
+            else:
+                raise ValueError(f"Unsupported environment: {self.env_name}")
+            postprocess_text_obs.append(obs)
+        return postprocess_text_obs
 
 
 class WebshopEnvironmentManager(EnvironmentManagerBase):
@@ -266,69 +449,251 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                 success['webshop_task_score (not success_rate)'].append(score_value)
                 return
 
-
-from .env_package.sotopia import SotopiaEnv
-class SotopiaEnvironmentManager(EnvironmentManagerBase):
-    def __init__(self, 
-                 judge_model: str = "gpt-4o",
-                 opponent_model: str = "gpt-3.5-turbo", 
-                 max_turns: int = 20,
-                 actor_role: str = "agent1",
-                 **kwargs):
-        super().__init__()
-        
-        self.judge_model = judge_model
-        self.opponent_model = opponent_model
-        self.max_turns = max_turns
-        self.actor_role = actor_role
-        self.env_kwargs = kwargs
-        
-    def make_env(self, env_id: int = 0) -> SotopiaEnv:
-        """Create a Sotopia environment instance"""
-        return SotopiaEnv(
-            judge_model=self.judge_model,
-            opponent_model_name=self.opponent_model,
-            max_turns=self.max_turns,
-            actor_role=self.actor_role,
-            **self.env_kwargs
-        )
+class AppWorldEnvironmentManager(EnvironmentManagerBase):
+    def __init__(self, envs, projection_f, env_name):
+        self.buffers = None
+        super().__init__(envs, projection_f, env_name)
     
-    def get_prompt(self, observation, **kwargs) -> str:
-        """Convert observation to prompt for the language model"""
-        if hasattr(observation, 'current_prompt'):
-            return observation.current_prompt
+    def reset(self):
+        text_obs, infos = self.envs.reset()
+        
+        self.supervisors = [info['supervisor'] for info in infos]
+        # initialize the history buffer
+        if self.buffers is not None:
+            self.buffers.clear()
+        self.buffers = [[] for _ in range(len(text_obs))]
+        self.tasks = text_obs.copy()
+        self.pre_text_obs = text_obs
+
+        full_text_obs = self.build_text_obs(text_obs, init=True)
+        return {'text': full_text_obs, 'image': None, 'anchor': text_obs}, infos
+    
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+
+        text_obs, rewards, dones, infos = self.envs.step(actions)
+
+        self.save_to_history_buffer(self.pre_text_obs, actions)
+        self.pre_text_obs = text_obs
+
+        full_text_obs = self.build_text_obs(text_obs)
+
+        # add action_valid to infos
+        for i, info in enumerate(infos):
+            info['is_action_valid'] = to_numpy(valids[i])
+
+        next_observations = {'text': full_text_obs, 'image': None, 'anchor': text_obs}
+        rewards = to_numpy(rewards)
+        dones = to_numpy(dones)
+
+        return next_observations, rewards, dones, infos
+    
+
+    def build_text_obs(self, text_obs: List[str], init: bool = False, history_length: int = 20) -> List[str]:
+        """
+        This function builds the text observation for the agent.
+        """
+        postprocess_text_obs = []
+        if init and self.supervisors is not None:
+            for i in range(len(text_obs)):
+                obs = APPWORLD_TEMPLATE_NO_HIS.format(
+                        supervisor_first_name=self.supervisors[i]['first_name'],
+                        supervisor_last_name=self.supervisors[i]['last_name'],
+                        supervisor_email=self.supervisors[i]['email'],
+                        supervisor_phone_number=self.supervisors[i]['phone_number'],
+                        task_description=self.tasks[i],
+                    )
+                postprocess_text_obs.append(obs)
         else:
-            # Fallback for string observations#
-            return str(observation)
-    
-    def parse_action(self, action_str: str) -> str:
-        """Parse action string to extract the actual response"""
-        # Simple parsing - in practice might want more sophisticated extraction
-        if isinstance(action_str, str):
-            # Remove any action tags or formatting
-            action_str = action_str.strip()
-            if action_str.startswith("Response:"):
-                action_str = action_str[9:].strip()
-            return action_str
-        return str(action_str)
-    
-    def is_terminal(self, observation) -> bool:
-        """Check if the episode has terminated"""
-        if hasattr(observation, 'is_done'):
-            return observation.is_done
-        return False
-    
-    def get_reward_function(self):
-        """Get reward function for Sotopia environment"""
-        # Reward is computed by the judge model at episode end
-        return None  # Environment handles reward internally
-    
-    def get_success_rate(self, episode_data) -> float:
-        """Calculate success rate based on judge evaluation"""
-        if 'reward' in episode_data and episode_data['reward'] > 0.6:
-            return 1.0
-        return 0.0
+            for i in range(len(text_obs)):
+                # Get last `history_length` steps
+                recent_history = self.buffers[i][-history_length:]
+                valid_history_length = len(recent_history)
+                start_index = len(self.buffers[i]) - valid_history_length
+                action_history = ""
+                for j, record in enumerate(recent_history):
+                    step_number = start_index + j + 1
+                    action = record["action"]
+                    env_obs = record["text_obs"]
+                    action_history += f"\n[Observation {step_number}: '{env_obs}', Code {step_number}: '{action}']"
 
+                obs = APPWORLD_TEMPLATE.format(
+                        supervisor_first_name=self.supervisors[i]['first_name'],
+                        supervisor_last_name=self.supervisors[i]['last_name'],
+                        supervisor_email=self.supervisors[i]['email'],
+                        supervisor_phone_number=self.supervisors[i]['phone_number'],
+                        task_description=self.tasks[i],
+                        step_count=len(self.buffers[i]),
+                        history_length=valid_history_length,
+                        action_history=action_history.strip(),
+                        current_step=len(self.buffers[i]) + 1,
+                    )
+                postprocess_text_obs.append(obs)
+        return postprocess_text_obs
+
+    def save_to_history_buffer(self, text_obs, actions):
+        for i in range(len(actions)):
+            self.buffers[i].append({'text_obs': text_obs[i], 'action': actions[i]})
+
+
+# from .env_package.sotopia import SotopiaEnv
+# from .prompts.sotopia import get_sotopia_prompt, get_sotopia_system_prompt
+
+
+# class SotopiaEnvironmentManager(EnvironmentManagerBase):
+#     def __init__(self, 
+#                  judge_model: str = "gpt-4o",
+#                  opponent_model: str = "gpt-3.5-turbo", 
+#                  max_turns: int = 20,
+#                  actor_role: str = "agent1",
+#                  **kwargs):
+#         super().__init__()
+        
+#         self.judge_model = judge_model
+#         self.opponent_model = opponent_model
+#         self.max_turns = max_turns
+#         self.actor_role = actor_role
+#         self.env_kwargs = kwargs
+        
+#     def make_env(self, env_id: int = 0) -> SotopiaEnv:
+#         """Create a Sotopia environment instance"""
+#         return SotopiaEnv(
+#             judge_model=self.judge_model,
+#             opponent_model_name=self.opponent_model,
+#             max_turns=self.max_turns,
+#             actor_role=self.actor_role,
+#             **self.env_kwargs
+#         )
+    
+#     def get_prompt(self, observation, **kwargs) -> str:
+#         """Convert observation to prompt for the language model"""
+#         if hasattr(observation, 'current_prompt'):
+#             return observation.current_prompt
+#         else:
+#             # Fallback for string observations
+#             return str(observation)
+    
+#     def parse_action(self, action_str: str) -> str:
+#         """Parse action string to extract the actual response"""
+#         # Simple parsing - in practice might want more sophisticated extraction
+#         if isinstance(action_str, str):
+#             # Remove any action tags or formatting
+#             action_str = action_str.strip()
+#             if action_str.startswith("Response:"):
+#                 action_str = action_str[9:].strip()
+#             return action_str
+#         return str(action_str)
+    
+#     def is_terminal(self, observation) -> bool:
+#         """Check if the episode has terminated"""
+#         if hasattr(observation, 'is_done'):
+#             return observation.is_done
+#         return False
+    
+#     def get_reward_function(self):
+#         """Get reward function for Sotopia environment"""
+#         # Reward is computed by the judge model at episode end
+#         return None  # Environment handles reward internally
+    
+#     def get_success_rate(self, episode_data) -> float:
+#         """Calculate success rate based on judge evaluation"""
+#         if 'reward' in episode_data and episode_data['reward'] > 0.6:
+#             return 1.0
+#         return 0.0
+
+
+class CoSerEnvironmentManager(EnvironmentManagerBase):
+    """
+    EnvironmentManager for CoSER role-playing environment.
+    """
+    def __init__(self, envs, projection_f, config):
+        self.memory = SimpleMemory()
+        self.config = config
+        super().__init__(envs, projection_f, config)
+    
+    def reset(self, kwargs):
+        """Reset the environment with new scenarios."""
+        text_obs, infos = self.envs.reset(kwargs)
+        
+        self.memory.reset(batch_size=len(text_obs))
+        self.tasks = []
+        self.characters = []
+        self.books = []
+        self.pre_text_obs = text_obs
+        
+        # Extract task information from infos
+        for info in infos:
+            self.tasks.append(info.get('scenario', ''))
+            self.characters.append(info.get('character', ''))
+            self.books.append(info.get('book', ''))
+        
+        full_text_obs = self.build_text_obs(text_obs, init=True)
+        return {'text': full_text_obs, 'image': None, 'anchor': text_obs}, infos
+    
+    def step(self, text_actions: List[str]):
+        """Execute actions in the environment."""
+        actions, valids = self.projection_f(text_actions)
+        text_obs, rewards, dones, infos = self.envs.step(actions)
+        
+        self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
+        self.pre_text_obs = text_obs
+        
+        full_text_obs = self.build_text_obs(text_obs)
+        
+        # Add action_valid to infos
+        for i, info in enumerate(infos):
+            info['is_action_valid'] = to_numpy(valids[i])
+        
+        next_observations = {'text': full_text_obs, 'image': None, 'anchor': text_obs}
+        rewards = to_numpy(rewards)
+        dones = to_numpy(dones)
+        
+        return next_observations, rewards, dones, infos
+    
+    def build_text_obs(self, text_obs: List[str], init: bool = False) -> List[str]:
+        """
+        Build text observation for the agent.
+        """
+        postprocess_text_obs = []
+        
+        if not init and self.config.env.history_length > 0:
+            memory_contexts, valid_lens = self.memory.fetch(
+                self.config.env.history_length,
+                obs_key="text_obs",
+                action_key="action"
+            )
+        
+        for i in range(len(text_obs)):
+            if init or self.config.env.history_length <= 0:
+                from agent_system.environments.prompts import \
+                    COSER_SIMPLE_CHARACTER_TEMPLATE
+                obs = COSER_SIMPLE_CHARACTER_TEMPLATE.format(
+                    character=self.characters[i] if i < len(self.characters) else "Character",
+                    book=self.books[i] if i < len(self.books) else "Book",
+                    character_profile="",  # Profile would be provided in actual scenario
+                    scenario=self.tasks[i] if i < len(self.tasks) else "",
+                    conversation_history=""
+                )
+            else:
+                from agent_system.environments.prompts import \
+                    COSER_SIMPLE_CHARACTER_TEMPLATE
+
+                # Build conversation history
+                history_str = ""
+                if valid_lens[i] > 0:
+                    history_str = f"\n\nConversation History ({valid_lens[i]} recent turns):\n{memory_contexts[i]}"
+                
+                obs = COSER_SIMPLE_CHARACTER_TEMPLATE.format(
+                    character=self.characters[i] if i < len(self.characters) else "Character",
+                    book=self.books[i] if i < len(self.books) else "Book",
+                    character_profile="",  # Profile would be provided in actual scenario
+                    scenario=self.tasks[i] if i < len(self.tasks) else "",
+                    conversation_history=history_str
+                )
+            
+            postprocess_text_obs.append(obs)
+        
+        return postprocess_text_obs
 
 def make_envs(config):
     """
@@ -338,7 +703,33 @@ def make_envs(config):
     if not isinstance(config.env.rollout.n, int):
         raise ValueError("config.env.rollout.n should be an integer")
     group_n = config.env.rollout.n if config.env.rollout.n > 0 else 1
-    if "sokoban" in config.env.env_name.lower():
+    if "gym_cards" in config.env.env_name.lower():
+        from agent_system.environments.env_package.gym_cards import (
+            build_gymcards_envs, gym_projection)
+        _envs = build_gymcards_envs(env_name=config.env.env_name, seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True)
+        _val_envs = build_gymcards_envs(env_name=config.env.env_name, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False)
+        
+        projection_f = partial(gym_projection, env_name=config.env.env_name)
+        envs = GymCardEnvironmentManager(_envs, projection_f, config.env.env_name)
+        val_envs = GymCardEnvironmentManager(_val_envs, projection_f, config.env.env_name)
+        return envs, val_envs
+    elif "alfworld" in config.env.env_name.lower():
+        from agent_system.environments.env_package.alfworld import (
+            alfworld_projection, build_alfworld_envs)
+        if config.env.env_name == 'alfworld/AlfredThorEnv':
+            alf_config_path = os.path.join(os.path.dirname(__file__), 'env_package/alfworld/configs/config_tw.yaml')
+        elif config.env.env_name == 'alfworld/AlfredTWEnv':
+            alf_config_path = os.path.join(os.path.dirname(__file__), 'env_package/alfworld/configs/config_tw.yaml')
+        else:
+            raise ValueError(f"Unsupported environment: {config.env.env_name}")
+        _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True)
+        _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False)
+        
+        projection_f = partial(alfworld_projection)
+        envs = AlfWorldEnvironmentManager(_envs, projection_f, config.env.env_name)
+        val_envs = AlfWorldEnvironmentManager(_val_envs, projection_f, config.env.env_name)
+        return envs, val_envs
+    elif "sokoban" in config.env.env_name.lower():
         from agent_system.environments.env_package.sokoban import (
             build_sokoban_envs, sokoban_projection)
         env_kwargs = {
@@ -379,13 +770,47 @@ def make_envs(config):
         import time
         time.sleep((config.data.train_batch_size * group_n + config.data.val_batch_size) * 0.1) # wait for the envs to be ready
         return envs, val_envs
-    elif "sotopia" in config.env.env_name.lower():
-        from agent_system.environments.env_package.sotopia import build_sotopia_envs
-        _envs = build_sotopia_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True)
-        _val_envs = build_sotopia_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False)
+    elif "appworld" in config.env.env_name.lower():
+        from agent_system.environments.env_package.appworld import (
+            appworld_projection, build_appworld_envs)
+        _envs = build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0)
+        _val_envs = build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size*group_n)
+        
+        projection_f = partial(appworld_projection)
+        envs = AppWorldEnvironmentManager(_envs, projection_f, config.env.env_name)
+        val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config.env.env_name)
+        return envs, val_envs
+    # elif "sotopia" in config.env.env_name.lower():
+    #     from agent_system.environments.env_package.sotopia import \
+    #         build_sotopia_envs
+    #     _envs = build_sotopia_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True)
+    #     _val_envs = build_sotopia_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False)
 
-        envs = SotopiaEnvironmentManager(_envs, config.env.env_name)
-        val_envs = SotopiaEnvironmentManager(_val_envs, config.env.env_name)
+    #     envs = SotopiaEnvironmentManager(_envs, config.env.env_name)
+    #     val_envs = SotopiaEnvironmentManager(_val_envs, config.env.env_name)
+    #     return envs, val_envs
+    elif "coser" in config.env.env_name.lower():
+        from agent_system.environments.env_package.coser import (
+            build_coser_envs, coser_projection)
+            
+        _envs = build_coser_envs(
+            seed=config.env.seed,
+            env_num=config.data.train_batch_size,
+            group_n=group_n,
+            is_train=True,
+            env_config=config.env
+        )
+        _val_envs = build_coser_envs(
+            seed=config.env.seed + 1000,
+            env_num=config.data.val_batch_size,
+            group_n=1,
+            is_train=False,
+            env_config=config.env
+        )
+        
+        projection_f = partial(coser_projection)
+        envs = CoSerEnvironmentManager(_envs, projection_f, config)
+        val_envs = CoSerEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     else:
         print("Environment not supported")
@@ -393,48 +818,250 @@ def make_envs(config):
 
 
 if __name__ == "__main__":
-    env_name = "webshop"
-    # Test WebshopEnvironmentManager
-    import time
-
-    from agent_system.environments.env_package.webshop import (
-        build_webshop_envs, webshop_projection)
-    from agent_system.environments.env_package.webshop.webshop.web_agent_site.models import \
-        RandomPolicy
-    env_num = 2
-    group_n = 5
-    time1 = time.time()
-    file_path = os.path.join(os.path.dirname(__file__), 'env_package/webshop/webshop/data/items_shuffle_1000.json')
-    attr_path = os.path.join(os.path.dirname(__file__), 'env_package/webshop/webshop/data/items_ins_v2_1000.json')
-    env_kwargs = {
-                'observation_mode': 'text', 
-                'num_products': None, 
-                'human_goals': True,
-                'file_path': file_path,
-                'attr_path': attr_path
-                }
-    envs = build_webshop_envs(seed=1, env_num=env_num, group_n=group_n, env_kwargs=env_kwargs, is_train=True)
-    # val_envs = build_webshop_envs(1000, 4)
-    env_manager = WebshopEnvironmentManager(envs, webshop_projection, 'webshop')
-    policy = RandomPolicy()
-    time2 = time.time()
-    print(f"env_num: {env_num}, group_n: {group_n}, init time: ", time2 - time1)
-    # val_env_manager = AlfWorldEnvironmentManager(val_envs, alfworld_projection, 'alfworld/AlfredTWEnv')
-    for k in range(10):
-        time1 = time.time()
+    env_name = "coser"
+    if env_name == "gym_cards":
+        # Test GymCardEnvironmentManager
+        env_num = 2
+        group_n = 5
+        from agent_system.environments.env_package.gym_cards import (
+            build_gymcards_envs, gym_projection)
+        envs = build_gymcards_envs('gym_cards/EZPoints-v0', 0, env_num, group_n)
+        projection_f = partial(gym_projection, env_name='gym_cards/EZPoints-v0')
+        env_manager = GymCardEnvironmentManager(envs, projection_f, 'gym_cards/EZPoints-v0')
         obs, infos = env_manager.reset()
-        for i in range(20):
-            # get random actions from admissible 'valid' commands (not available for AlfredThorEnv)
-            print("step: ", i)
-            random_actions = ['<action>'+policy.forward(None, info['available_actions'])+'</action>' for info in infos]
-            # step
+        for i in range(100):
+            random_actions = [f'"action": {np.random.randint(0, 10)}' for i in range(len(infos))]
             obs, rewards, dones, infos = env_manager.step(random_actions)
+            env_manager.save_image(obs['image'], i)
+        print("completed")
+    elif env_name == "alfworld":
+        # Test AlfWorldEnvironmentManager
+        import time
+
+        from agent_system.environments.env_package.alfworld import (
+            alfworld_projection, build_alfworld_envs)
+        alf_config_path = os.path.join(os.path.dirname(__file__), 'env_package/alfworld/configs/config_tw.yaml')
+        env_num = 8
+        group_n = 5
+        time1 = time.time()
+        envs = build_alfworld_envs(alf_config_path, seed=1, env_num=env_num, group_n=group_n)
+        # val_envs = build_alfworld_envs(alf_config_path, 1000, 4)
+        env_manager = AlfWorldEnvironmentManager(envs, alfworld_projection, 'alfworld/AlfredThorEnv')
+        time2 = time.time()
+        print(f"env_num: {env_num}, group_n: {group_n}, init time: ", time2 - time1)
+        # val_env_manager = AlfWorldEnvironmentManager(val_envs, alfworld_projection, 'alfworld/AlfredTWEnv')
+        for k in range(10):
+            time1 = time.time()
+            obs, infos = env_manager.reset()
+            for i in range(20):
+                # get random actions from admissible 'valid' commands (not available for AlfredThorEnv)
+                print("step: ", i)
+                random_actions = [np.random.choice(env_manager.envs.get_admissible_commands[i]) for i in range(len(env_manager.envs.get_admissible_commands))]
+                # step
+                obs, rewards, dones, infos = env_manager.step(random_actions)
+                if np.array(dones).any():
+                    print("Episode completed")
+
+                for k in range(len(infos)):
+                    assert infos[k]['won'] == False
+                if obs['image'] is not None:
+                    env_manager.save_image(obs['image'], i)
+                # print("obs['image'].shape: ", obs['image'].shape)
+            time2 = time.time()
+            print(f"env_num: {env_num}, group_n: {group_n}, Time elapsed: ", time2 - time1)
+            print("completed")
+
+    elif env_name == "sokoban":
+        # Test SokobanEnvironmentManager
+        from agent_system.environments.env_package.sokoban import (
+            build_sokoban_envs, sokoban_projection)
+        env_num = 2
+        group_n = 5
+        env_kwargs = {
+            'dim_room': (6, 6),
+            'num_boxes': 1,
+            'max_steps': 100,
+            'search_depth': 30
+        }
+        action_pools = {
+            1: "<action>up</action>",
+            2: "<action>down</action>",
+            3: "<action>left</action>",
+            4: "<action>right</action>",
+        }
+        # ['tiny_rgb_array', 'list', 'state', 'rgb_array']
+        envs = build_sokoban_envs(0, env_num, group_n, mode='rgb_array', is_train=True, env_kwargs=env_kwargs)
+        projection_f = partial(sokoban_projection)
+        env_manager = SokobanEnvironmentManager(envs, projection_f, 'sokoban')
+        obs, infos = env_manager.reset()
+        for i in range(100):
+            random_actions = [action_pools[np.random.randint(1, 5)] for i in range(len(infos))]
+            obs, rewards, dones, infos = env_manager.step(random_actions)
+            if obs['image'] is not None:
+                env_manager.save_image(obs['image'][0], i)
             if np.array(dones).any():
                 print("Episode completed")
+    elif env_name == "webshop":
+        # Test WebshopEnvironmentManager
+        import time
 
-            if obs['image'] is not None:
-                env_manager.save_image(obs['image'], i)
-            # print("obs['image'].shape: ", obs['image'].shape)
+        from agent_system.environments.env_package.webshop import (
+            build_webshop_envs, webshop_projection)
+        from agent_system.environments.env_package.webshop.webshop.web_agent_site.models import \
+            RandomPolicy
+        env_num = 2
+        group_n = 5
+        time1 = time.time()
+        file_path = os.path.join(os.path.dirname(__file__), 'env_package/webshop/webshop/data/items_shuffle_1000.json')
+        attr_path = os.path.join(os.path.dirname(__file__), 'env_package/webshop/webshop/data/items_ins_v2_1000.json')
+        env_kwargs = {
+                    'observation_mode': 'text', 
+                    'num_products': None, 
+                    'human_goals': True,
+                    'file_path': file_path,
+                    'attr_path': attr_path
+                    }
+        envs = build_webshop_envs(seed=1, env_num=env_num, group_n=group_n, env_kwargs=env_kwargs, is_train=True)
+        # val_envs = build_webshop_envs(1000, 4)
+        env_manager = WebshopEnvironmentManager(envs, webshop_projection, 'webshop')
+        policy = RandomPolicy()
         time2 = time.time()
-        print(f"env_num: {env_num}, group_n: {group_n}, Time elapsed: ", time2 - time1)
-    print("completed")
+        print(f"env_num: {env_num}, group_n: {group_n}, init time: ", time2 - time1)
+        # val_env_manager = AlfWorldEnvironmentManager(val_envs, alfworld_projection, 'alfworld/AlfredTWEnv')
+        for k in range(10):
+            time1 = time.time()
+            obs, infos = env_manager.reset()
+            for i in range(20):
+                # get random actions from admissible 'valid' commands (not available for AlfredThorEnv)
+                print("step: ", i)
+                random_actions = ['<action>'+policy.forward(None, info['available_actions'])+'</action>' for info in infos]
+                # step
+                obs, rewards, dones, infos = env_manager.step(random_actions)
+                if np.array(dones).any():
+                    print("Episode completed")
+
+                if obs['image'] is not None:
+                    env_manager.save_image(obs['image'], i)
+                # print("obs['image'].shape: ", obs['image'].shape)
+            time2 = time.time()
+            print(f"env_num: {env_num}, group_n: {group_n}, Time elapsed: ", time2 - time1)
+        print("completed")
+
+    elif env_name == "appworld":
+        # Test AppWorldEnvironmentManager
+        import time
+
+        from agent_system.environments.env_package.appworld import (
+            appworld_projection, build_appworld_envs)
+        env_num = 2
+        group_n = 5
+        time1 = time.time()
+        envs = build_appworld_envs(dataset_name='test_normal', max_interactions=50, seed=1, env_num=env_num, group_n=group_n)
+        # val_envs = build_alfworld_envs(alf_config_path, 1000, 4)
+        env_manager = AppWorldEnvironmentManager(envs, appworld_projection, 'appworld')
+        time2 = time.time()
+        print(f"env_num: {env_num}, group_n: {group_n}, init time: ", time2 - time1)
+        # val_env_manager = AlfWorldEnvironmentManager(val_envs, alfworld_projection, 'alfworld/AlfredTWEnv')
+        for k in range(10):
+            time1 = time.time()
+            obs, infos = env_manager.reset()
+            for i in range(20):
+                # get random actions from admissible 'valid' commands (not available for AlfredThorEnv)
+                print("step: ", i)
+                random_actions = ["print(apis.api_docs.show_api_doc(app_name='supervisor', api_name='show_account_passwords'))" for i in range(len(obs['text']))]
+                # print(apis.api_docs.show_api_descriptions(app_name='supervisor'))
+                # step
+                obs, rewards, dones, infos = env_manager.step(random_actions)
+                if np.array(dones).any():
+                    print("Episode completed")
+
+                for k in range(len(infos)):
+                    assert infos[k]['won'] == False
+                if obs['image'] is not None:
+                    env_manager.save_image(obs['image'], i)
+                # print("obs['image'].shape: ", obs['image'].shape)
+            time2 = time.time()
+            print(f"env_num: {env_num}, group_n: {group_n}, Time elapsed: ", time2 - time1)
+        print("completed")
+    elif env_name == "coser":
+        import time
+
+        from omegaconf import OmegaConf
+
+        from agent_system.environments.env_package.coser import (
+            build_coser_envs, coser_projection)
+        
+        env_num = 2
+        group_n = 5
+        time1 = time.time()
+        
+        # Create minimal config for CoSER environment
+        # Note: You'll need actual dataset files for real testing
+        env_config = OmegaConf.create({
+            'max_steps': 10,
+            'train_dataset_path': '/mnt/data/xiaoqian/verl-agent/agent_system/environments/env_package/coser/data/test_set.json',  
+            'test_dataset_path': '/mnt/data/xiaoqian/verl-agent/agent_system/environments/env_package/coser/data/test_set.json',    
+            # 'judge_model': 'qwen3-235b-instruct-2507', 
+            'judge_model': 'gpt-4o-2024-08-06',  
+            'judge_api_key': 'sk-739b2068c60940bc95ba9c93c0f4714e',
+            'judge_base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
+        })
+        
+        # Build environments
+        
+        envs = build_coser_envs(
+            seed=1, 
+            env_num=env_num, 
+            group_n=group_n, 
+            is_train=True,
+            env_config=env_config
+        )
+        
+        # Create simple config object for env_manager
+        class SimpleConfig:
+            def __init__(self):
+                self.env = OmegaConf.create({'history_length': 3})
+        
+        config = SimpleConfig()
+        env_manager = CoSerEnvironmentManager(envs, coser_projection, config)
+        time2 = time.time()
+        print(f"env_num: {env_num}, group_n: {group_n}, init time: ", time2 - time1)
+        
+        # Test reset and step
+        for k in range(3):
+            time1 = time.time()
+            obs, infos = env_manager.reset([{} for _ in range(env_num)])
+            print(f"\n=== Episode {k+1} ===")
+            print(f"Number of environments: {len(obs['text'])}")
+            print(f"First observation: {obs['text'][0]}")
+            
+            for i in range(10):
+                print(f"\nStep {i+1}:")
+                
+                # Generate sample dialogue actions
+                sample_dialogues = [
+                    "[I'm considering my response carefully] Hello, how are you?",
+                    "[feeling curious] That's interesting! Tell me more.",
+                    "[nodding thoughtfully] I understand what you mean.",
+                    "[smiling warmly] Yes, I completely agree with you!",
+                    "[pausing to think] Let me think about that for a moment.",
+                ]
+                random_actions = [np.random.choice(sample_dialogues) for _ in range(len(obs['text']))]
+                
+                # Step through environment
+                obs, rewards, dones, infos = env_manager.step(random_actions)
+                
+                print(f"  Rewards: {rewards}")
+                print(f"  Dones: {dones}")
+                print(f"  Action valid: {[info.get('is_action_valid', 'N/A') for info in infos]}")
+                
+                if np.array(dones).any():
+                    print("  Episode completed!")
+                    break
+            
+            time2 = time.time()
+            print(f"\nenv_num: {env_num}, group_n: {group_n}, Time elapsed: ", time2 - time1)
+        
+        print("\n=== CoSER Test Completed Successfully ===")
+        
+        
