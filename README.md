@@ -19,7 +19,7 @@ The Qwen-Character model is a branch model built upon the basic Qwen model. Whil
 
 We selected eight representative datasets—CharacterEval, CharacterBench, CoSER, WikiRole, TomBench, OpenTom, EmoBench, and MemoryEval—from publicly available industry benchmarks related to character analysis for performance evaluation. Since each benchmark has multiple and inconsistent evaluation dimensions, directly aggregating the results makes it difficult to reflect the model's detailed performance across each dimension. Therefore, we reorganized and summarized the results across eight dimensions: basic dialogue, dialogue appeal, memory, knowledge, personality, emotion, mindset, and morality, constructing a Character-Leaderboard. The Qwen-Character model has achieved leading performance across all dimensions.
 
-Regarding specific evaluation methods, CharacterEval and CharacterBench use dedicated benchmarking tools to score single-turn responses based on dimensions such as dialogue, character design, and plot. CoSER uses GPT-40 for multi-turn dialogues. WikiRole and MemoryEval employ a knowledge-based question-and-answer format with GPT-40 scoring. TomBench, OpenTom, and EmoBench use multiple-choice questions for evaluation.
+Regarding specific evaluation methods, CharacterEval and CharacterBench use dedicated benchmarking tools to score single-turn responses based on dimensions such as dialogue, character design, and plot. CoSER uses GPT-4o for multi-turn dialogues. WikiRole and MemoryEval employ a knowledge-based question-and-answer format with GPT-4o scoring. TomBench, OpenTom, and EmoBench use multiple-choice questions for evaluation.
 
 
 # News
