@@ -646,7 +646,7 @@ if __name__ == "__main__":
     )
 
     # Use xlsx output
-    BASE_OUTPUT_PATH = f"/mnt/{space}/zpy/Pers_RM/vllm_pre_experiments/with_proto/{MODEL_NAME}.xlsx"
+    BASE_OUTPUT_PATH = f"../vllm_experiments/with_proto/{MODEL_NAME}.xlsx"
 
     # Global stats
     global_total = 0

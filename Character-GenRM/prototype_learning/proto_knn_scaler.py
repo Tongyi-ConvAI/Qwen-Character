@@ -9,7 +9,7 @@ import pandas as pd
 from typing import List, Tuple, Optional, Dict
 
 import torch
-
+import concurrent.futures
 # Lightweight local ST encoder
 class _LocalST:
     def __init__(self, model_path: str, device: Optional[str] = None, batch_size: int = 128):
@@ -152,9 +152,7 @@ class ProtoKNNUpliftScorer:
 
     # === Given fewshots + current user_input/response_list → use local vLLM to get both-side scores ===
     def _score_with_fewshots_once(self, fewshots_text: str, user_input: str, response_list: List[str]) -> Tuple[Optional[float], Optional[float]]:
-        # Two prompts from main script (same as there)
-        from o3_pre_experiments.PROMPTS import USER_PROMPT_TEMPLATE
-        from o3_pre_experiments.GRPO_PROMPTS import USER_PREFERENCE_ANALYSIS_PROMPT
+        from inference.PROMPTS import USER_PREFERENCE_ANALYSIS_PROMPT,USER_PROMPT_TEMPLATE
         # Few-shot direct concatenation
         system_prompt = USER_PREFERENCE_ANALYSIS_PROMPT.format(few_shots=fewshots_text)
         user_prompt = USER_PROMPT_TEMPLATE.format(
@@ -291,6 +289,116 @@ class ProtoKNNUpliftScorer:
             print(f"[uplift] self_avg=(r1={self_r1}, r2={self_r2}), "
                   f"nb_avg=(r1={nb_r1}, r2={nb_r2}), "
                   f"final=(r1={final_r1}, r2={final_r2}), choice={choice_idx}")
+
+        return {
+            "ok": True,
+            "proto_id": proto_id,
+            "neighbor_count": len(neighbor_rows),
+            "neighbor_rows": neighbor_rows,
+            "neighbor_sims": proc_sims,
+            "choice_idx": choice_idx,
+            "scores": {
+                "self":      {"r1": self_r1, "r2": self_r2},
+                "neighbors": {"r1": nb_r1,   "r2": nb_r2},
+                "final":     {"r1": final_r1, "r2": final_r2},
+            },
+        }
+
+    def score_parallel(self,
+                   current_examples_text: str,
+                   response_list: List[str],
+                   current_user_input: str,
+                   current_userid: str,
+                   topk: int = 4,
+                   coef_self: float = 0.5,
+                   coef_neighbors: float = 0.5,
+                   self_scores: Tuple[Optional[float], Optional[float]] = (None, None),
+                   max_workers: int = 8) -> Dict:
+        """
+        Parallel version of the score function:
+        Use ThreadPoolExecutor to simultaneously send LLM scoring requests for the topK neighbors.
+        """
+        # 1) Extract history block and encode (same as original score)
+        hist = _extract_history_block(current_examples_text)
+        text_for_embed = hist if hist else current_examples_text
+        if not text_for_embed.strip():
+            return {"ok": False, "reason": "empty_examples_text"}
+
+        q_vec = self.st.encode([text_for_embed])[0]
+
+        # 2) Find nearest prototype and neighbors
+        sims_proto = self.A @ q_vec
+        proto_id = int(np.argmax(sims_proto))
+        proc_idx, proc_sims = self._topk_neighbors(proto_id, q_vec, topk)
+        if len(proc_idx) == 0:
+            return {"ok": False, "reason": "no_members_in_proto", "proto_id": proto_id}
+
+        neighbor_rows = [int(self.row_index[i]) for i in proc_idx]
+
+        # 3) [Core modification] Fetch neighbor scores in parallel
+        r1_vals, r2_vals = [], []
+        
+        def _fetch_single_neighbor_score(ori_row):
+            fewshots = self._get_fewshots_by_row(ori_row)
+            # This calls the existing _score_with_fewshots_once method in your class
+            return self._score_with_fewshots_once(fewshots, current_user_input, response_list)
+
+        # Use thread pool to send concurrent requests to vLLM/OpenAI
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit tasks and retrieve results in order
+            future_results = list(executor.map(_fetch_single_neighbor_score, neighbor_rows))
+
+        for s1, s2 in future_results:
+            if s1 is not None: 
+                r1_vals.append(s1)
+            if s2 is not None: 
+                r2_vals.append(s2)
+
+        nb_r1 = (sum(r1_vals) / len(r1_vals)) if r1_vals else None
+        nb_r2 = (sum(r2_vals) / len(r2_vals)) if r2_vals else None
+
+        # 4) Combine scores (same logic as original score; rewritten here for clarity)
+        self_r1, self_r2 = self_scores
+        parts = []
+        if self_r1 is not None or self_r2 is not None:
+            parts.append(("self", coef_self, (self_r1, self_r2)))
+        if nb_r1 is not None or nb_r2 is not None:
+            parts.append(("neighbors", coef_neighbors, (nb_r1, nb_r2)))
+
+        if not parts:
+            return {"ok": False, "reason": "no_scores", "proto_id": proto_id, "neighbor_rows": neighbor_rows}
+
+        w_sum = sum(w for _, w, sc in parts if (sc[0] is not None or sc[1] is not None))
+        if w_sum <= 0:
+            return {"ok": False, "reason": "zero_weight", "proto_id": proto_id}
+
+        def combine(idx: int) -> Optional[float]:
+            num, denom = 0.0, 0.0
+            for _, w, sc in parts:
+                s = sc[idx]
+                if s is not None:
+                    num += w * s
+                    denom += w
+            return (num / denom) if denom > 0 else None
+
+        final_r1 = combine(0)
+        final_r2 = combine(1)
+        
+        if final_r1 is None and final_r2 is None:
+            return {"ok": False, "reason": "both_sides_none_after_combine", "proto_id": proto_id}
+
+        # 5) Final decision
+        if final_r1 is None and final_r2 is not None:
+            choice_idx = 1
+        elif final_r2 is None and final_r1 is not None:
+            choice_idx = 0
+        else:
+            # If tied, default to R1 (0)
+            choice_idx = 0 if final_r1 >= final_r2 else 1
+
+        if self.print_debug:
+            print(f"[uplift-parallel] proto={proto_id} | neighbors={len(neighbor_rows)}")
+            print(f"[uplift-parallel] final=(r1={final_r1}, r2={final_r2}), choice={choice_idx}")
 
         return {
             "ok": True,
