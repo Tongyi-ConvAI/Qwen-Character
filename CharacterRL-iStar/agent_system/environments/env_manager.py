@@ -1003,7 +1003,7 @@ if __name__ == "__main__":
             'test_dataset_path': '/mnt/data/xiaoqian/verl-agent/agent_system/environments/env_package/coser/data/test_set.json',    
             # 'judge_model': 'qwen3-235b-instruct-2507', 
             'judge_model': 'gpt-4o-2024-08-06',  
-            'judge_api_key': 'sk-739b2068c60940bc95ba9c93c0f4714e',
+            'judge_api_key': '',
             'judge_base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
         })
         
