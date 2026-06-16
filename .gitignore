@@ -1,0 +1,18 @@
+# Python caches
+__pycache__/
+*.pyc
+# training run artifacts
+code/training/outputs/
+code/training/smoke_out/
+code/training/ckpt_*/
+**/ray_*/
+# eval run outputs
+results/
+# stray backups
+*.pre_restore.*
+*.bak
+*.bak.*
+# leaderboard data (too large for GitHub)
+data/leaderboard_*/
+# merged data dump
+data_merged.json

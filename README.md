@@ -1,28 +1,110 @@
-<div align="center">
-<p align="center">
-  <h1>
-  <img width="3074" height="588" alt="image" src="https://github.com/user-attachments/assets/c252a912-be81-4577-a4bb-fca0f3e455c8" />
-  </h1>
-</p>
-</div>
+# EIBench & CTC-GRPO
 
-AI-powered social apps have reached 100 million monthly active users and continue to grow. In addition, real-person social apps have billions of users, which requires AI-assisted social interaction, indicating vast market potential for LLM-based social intelligence.
+EIBench is a multi-turn benchmark for **emotion management**: a model talks to an
+LLM **simulator** that plays the user across several turns, and is scored by how
+the user's `(anger, trust)` state moves toward per-scenario anchors. Scenarios
+span four scene types — **Support / Defense / Repair / Charm**.
 
-The Qwen-Character model is a branch model built upon the basic Qwen model. While the basic model models "world knowledge," the Qwen-Character model models "humans." Qwen-Character encompasses typical application scenarios such as role-playing, emotional companionship, avatar replication, smart hardware, and digital employees. Qwen-Character optimizes its modeling around six core human capabilities: personality, emotion, memory, mindset, knowledge, and morality, achieving leading results.
+**CTC-GRPO** (Centered Turn-Credit GRPO) trains on EIBench by reusing the
+simulator's per-turn state changes as a dense process reward, adding a centered
+turn-level credit term to the GRPO advantage:
+`A_τ = A_trace + α · (r_proc_τ − mean_τ r_proc)`.
 
-👏 Welcome to try our Qwen-Character Model via our [bailian service](https://help.aliyun.com/zh/model-studio/role-play)! 
+## Repository layout
 
-# Character-Leaderboard
+```
+data/
+  test/        213 held-out scenarios (the benchmark); {charm,defense,repair,support}_final.jsonl
+  train/       ~2000 training scenarios, same schema
+code/
+  src/
+    simulator_v2.py        the user-simulator + anchor-based scoring (shared core)
+  evaluation/
+    run_eval.py / run_eval.sh   evaluate one model on EIBench -> per-scene & overall reward
+    README.md
+  data_generation/
+    generate_scenarios.py  sample seed pools -> LLM-expand into full scenarios + anchors
+    clean_scenarios.py     rule-based section-format check + LLM re-clean
+    run_pipeline.sh        one-click: generate -> clean
+    README.md
+  training/
+    verl/                  RL framework (FSDP + vLLM) with the CTC-GRPO additions
+    scripts/
+      train_8b.sh          Qwen3-8B run (paper hyperparameters)
+      train_32b.sh         Qwen3-32B run (paper hyperparameters)
+    requirements.txt       pinned, mutually-compatible dependency versions
+```
 
-<img width="2794" height="1190" alt="image" src="https://github.com/user-attachments/assets/77bc21d8-f496-4fda-b83b-3385ae3a7124" />
+Each scenario carries two role profiles (`aggressor_profile` = simulated user,
+`defender_profile` = model under test), an opening line, and three state anchors
+(`initial_calibration` / `rub_goals` / `worst_case`).
 
+## Environment setup
 
-We selected eight representative datasets—CharacterEval, CharacterBench, CoSER, WikiRole, TomBench, OpenTom, EmoBench, and MemoryEval—from publicly available industry benchmarks related to character analysis for performance evaluation. Since each benchmark has multiple and inconsistent evaluation dimensions, directly aggregating the results makes it difficult to reflect the model's detailed performance across each dimension. Therefore, we reorganized and summarized the results across eight dimensions: basic dialogue, dialogue appeal, memory, knowledge, personality, emotion, mindset, and morality, constructing a Character-Leaderboard. The Qwen-Character model has achieved leading performance across all dimensions.
+The simulator and the generation/cleaning steps call an **OpenAI-compatible**
+LLM endpoint over HTTP; no model weights are needed for evaluation or data work.
+Training additionally needs GPUs, FSDP, and vLLM.
 
-Regarding specific evaluation methods, CharacterEval and CharacterBench use dedicated benchmarking tools to score single-turn responses based on dimensions such as dialogue, character design, and plot. CoSER uses GPT-4o for multi-turn dialogues. WikiRole and MemoryEval employ a knowledge-based question-and-answer format with GPT-4o scoring. TomBench, OpenTom, and EmoBench use multiple-choice questions for evaluation.
+```bash
+# Python 3.10+; a CUDA-matched torch/vLLM stack is required for training.
+cd code/training
+pip install -r requirements.txt
+```
 
+`requirements.txt` holds the exact, mutually-compatible versions we trained with
+(torch 2.8 / vLLM 0.11 / transformers 4.57 / ray 2.54 / flash-attn 2.8 ...). The
+torch / vLLM / transformers / flash-attn versions are tightly coupled — install a
+set that matches your CUDA, following the verl install guide if you deviate.
 
-# News
-- **[2026.02]** `P-GenRM` has been accepted to ICLR 2026 as an **oral presentation (Top 1%)**. P-GenRM turns user preference signals into structured evaluation chains and introduces test-time user-based scaling (with user prototypes) to improve personalization and generalization, achieving state-of-the-art results on personalized reward model benchmarks. [[Code]](https://github.com/Tongyi-ConvAI/Qwen-Character/tree/main/Character-GenRM) [[Paper]]()
-- **[2026.01]** `iStar` has been accepted to ICLR 2026! iStar learns implicit step rewards from trajectory preferences and improves credit assignment without step labels or extra rollouts. It achieves strong results on WebShop, VisualSokoban, and SOTOPIA. [[Code]](https://github.com/Tongyi-ConvAI/Qwen-Character/tree/main/CharacterRL-iStar) [[Paper]](https://arxiv.org/abs/2509.19199)
+## Reproduce
 
+### 1. Evaluate a model on EIBench
+
+Drop any model into the simulator and score it on the 213-scenario test set.
+Set the two credential sets (simulator + model under test), then:
+
+```bash
+cd code
+bash evaluation/run_eval.sh
+```
+
+See `code/evaluation/README.md` for the env vars and output format
+(`results/<model>/summary.json` with per-scene and overall reward).
+
+### 2. (Optional) Generate more training scenarios
+
+Implement the empty `call_llm()` in the two scripts (the paper uses
+Gemini-3.1-Pro), then:
+
+```bash
+cd code
+SCENE=charm N=50 bash data_generation/run_pipeline.sh   # generate -> format-clean
+```
+
+Details in `code/data_generation/README.md`.
+
+### 3. Train with CTC-GRPO
+
+Fill in `MODEL_PATH`, `SIMULATOR_API_KEYS`, `SIMULATOR_BASE_URL` at the top of the
+script, then:
+
+```bash
+cd code/training
+
+# full runs (paper hyperparameters)
+bash scripts/train_8b.sh     
+bash scripts/train_32b.sh    
+```
+
+Each script starts a local Ray head and launches `verl.trainer.main_ppo` with the
+CTC-GRPO settings (`turn_credit_alpha`, `grpo_std_min`, the simulator rollout
+environment). Checkpoints and `train.log` are written under the script's output
+dir. Set `WANDB_MODE=online` + `WANDB_API_KEY` to log to Weights & Biases.
+
+The simulator is reached over HTTP via `SIMULATOR_BASE_URL` / `SIMULATOR_API_KEYS`
+using `SIMULATOR_MODEL` (default `qwen3-max`).
+
+## License
+
+- **Dataset** (`data/`): [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — see `data/README.md` for details.
+- **Code** (`code/`): [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
