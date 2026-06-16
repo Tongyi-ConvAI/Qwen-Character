@@ -23,6 +23,7 @@ Regarding specific evaluation methods, CharacterEval and CharacterBench use dedi
 
 
 # News
+- **[2026.05]** `RM-NLHF` has been accepted to ICML 2026! We identify the issue of outcome-process inconsistency in current Generative Reward Model (GRM) training. Subsequently, we propose RM-NLHF, which trains a reward model using natural language instead of just preference labels as training rewards, leading to GRMs that achieve SOTA results on general reward model benchmarks. [[Code]](https://github.com/Tongyi-ConvAI/Qwen-Character/tree/main/Character-GenRM-NLHF) [[Paper]](https://arxiv.org/abs/2601.07349)
 - **[2026.02]** `P-GenRM` has been accepted to ICLR 2026 as an **oral presentation (Top 1%)**. P-GenRM turns user preference signals into structured evaluation chains and introduces test-time user-based scaling (with user prototypes) to improve personalization and generalization, achieving state-of-the-art results on personalized reward model benchmarks. [[Code]](https://github.com/Tongyi-ConvAI/Qwen-Character/tree/main/Character-GenRM) [[Paper]]()
 - **[2026.01]** `iStar` has been accepted to ICLR 2026! iStar learns implicit step rewards from trajectory preferences and improves credit assignment without step labels or extra rollouts. It achieves strong results on WebShop, VisualSokoban, and SOTOPIA. [[Code]](https://github.com/Tongyi-ConvAI/Qwen-Character/tree/main/CharacterRL-iStar) [[Paper]](https://arxiv.org/abs/2509.19199)
 

@@ -36,6 +36,7 @@ This is the official code of paper "Reward Modeling from Natural Language Human 
 ---
 
 ## 📜 News
+- [10/05/26] 🔥 Our paper is accepted by ICML 2026!
 - [25/02/26] 🔥 We have released all checkpoints and part of datasets.
 - [25/02/26] 🔥 We have released the training code of RM-NLHF.
 - [12/01/26] 🔥 We have uploaded the full paper in [arXiv](https://arxiv.org/abs/2601.07349).
